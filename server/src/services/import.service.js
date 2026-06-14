@@ -4,7 +4,7 @@ import dayjs from 'dayjs';
 import customParseFormat from 'dayjs/plugin/customParseFormat.js';
 import prisma from '../config/prisma.js';
 import { SplitType } from '@prisma/client';
-import AppError from '../utils/AppError.js';
+import { AppError } from '../middleware/error.middleware.js';
 
 dayjs.extend(customParseFormat);
 
