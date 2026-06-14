@@ -99,6 +99,9 @@ export default function ImportExpenses() {
                   Total Rows: <strong>{previewData.summary.total}</strong> · 
                   Valid: <strong style={{ color: '#22c55e' }}>{previewData.summary.valid}</strong> · 
                   Anomalies: <strong style={{ color: '#ef4444' }}>{previewData.summary.anomalies}</strong>
+                  {previewData.summary.usersToCreate?.length > 0 && (
+                    <> · New users to create: <strong>{previewData.summary.usersToCreate.join(', ')}</strong></>
+                  )}
                 </p>
               </div>
               <div style={{ display: 'flex', gap: '1rem', alignItems: 'center' }}>

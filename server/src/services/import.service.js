@@ -77,12 +77,20 @@ function parseSplitDetails(raw) {
   return result;
 }
 
+function normalizeCsvRow(row) {
+  const normalized = {};
+  for (const [key, value] of Object.entries(row)) {
+    normalized[key.replace(/^\ufeff/, '').trim().toLowerCase()] = value;
+  }
+  return normalized;
+}
+
 export const previewImport = async (fileBuffer) => {
   return new Promise((resolve, reject) => {
     const rows = [];
     Readable.from(fileBuffer)
       .pipe(csvParser())
-      .on('data', (row) => rows.push(row))
+      .on('data', (row) => rows.push(normalizeCsvRow(row)))
       .on('end', async () => {
         try {
           const processedData = await processPreviewRows(rows);
@@ -98,15 +106,22 @@ export const previewImport = async (fileBuffer) => {
 const processPreviewRows = async (rows) => {
   const anomalies = [];
   const processedRows = [];
-  const summary = { total: rows.length, valid: 0, anomalies: 0 };
+  const usersToCreate = new Set();
+  const summary = { total: rows.length, valid: 0, anomalies: 0, usersToCreate: [] };
   const seenKeys = new Set();
   
-  // Find all DB users
+  // Find all DB users — missing names are auto-created on confirm, not preview anomalies
   const dbUsers = await prisma.user.findMany();
   const dbUserMap = dbUsers.reduce((acc, u) => {
     acc[u.name.toLowerCase()] = u;
     return acc;
   }, {});
+
+  const trackNewUser = (name) => {
+    if (name && !dbUserMap[name.toLowerCase()]) {
+      usersToCreate.add(name);
+    }
+  };
 
   let rowId = 1;
 
@@ -167,13 +182,16 @@ const processPreviewRows = async (rows) => {
       }
     }
 
-    // 5. Missing / Unknown Users
+    // 5. Missing payer only — new users are auto-created on confirm, not flagged here
     if (!payerName) {
       anomalyDetails.push(`Missing Payer for expense: ${description}`);
       if (!issueType) { issueType = 'Missing Payer'; suggestedAction = 'Reject Row'; }
-    } else if (!dbUserMap[payerName.toLowerCase()]) {
-       anomalyDetails.push(`Unknown payer "${payerName}".`);
-       if (!issueType) { issueType = 'Unknown User'; suggestedAction = 'Create User'; }
+    } else {
+      trackNewUser(payerName);
+    }
+
+    for (const member of parseSplitWith(splitWithRaw)) {
+      trackNewUser(member);
     }
 
     const processedRow = {
@@ -209,6 +227,7 @@ const processPreviewRows = async (rows) => {
 
   // Detect USD presence
   const hasUSD = processedRows.some(r => r.parsed.currency === 'USD');
+  summary.usersToCreate = [...usersToCreate].sort();
 
   return { summary, rows: processedRows, anomalies, hasUSD };
 };
@@ -243,28 +262,42 @@ export const confirmImport = async (groupId, rows, exchangeRate) => {
         throw new AppError(`Invalid amount for expense "${p.description || 'Unknown'}".`, 400);
       }
       
-      // Auto-create missing users if approved
+      // Auto-create missing users if approved (use upsert to avoid duplicate email conflicts)
       if (p.paidBy && !userMap[p.paidBy.toLowerCase()]) {
-        const newUser = await tx.user.create({
-          data: { name: p.paidBy, email: `${p.paidBy.toLowerCase()}@splitwise.demo`, passwordHash: 'hashed' }
+        const newUser = await tx.user.upsert({
+          where: { email: `${p.paidBy.toLowerCase()}@splitwise.demo` },
+          update: {},
+          create: { name: p.paidBy, email: `${p.paidBy.toLowerCase()}@splitwise.demo`, passwordHash: 'hashed' }
         });
         userMap[p.paidBy.toLowerCase()] = newUser.id;
         
-        // Add to group
-        await tx.groupMember.create({
-          data: { groupId, userId: newUser.id }
+        // Add to group if not already a member
+        const existingMember = await tx.groupMember.findUnique({
+          where: { groupId_userId: { groupId, userId: newUser.id } }
         });
+        if (!existingMember) {
+          await tx.groupMember.create({
+            data: { groupId, userId: newUser.id }
+          });
+        }
       }
       
       for (const member of p.splitWith) {
         if (!userMap[member.toLowerCase()]) {
-          const newUser = await tx.user.create({
-            data: { name: member, email: `${member.toLowerCase()}@splitwise.demo`, passwordHash: 'hashed' }
+          const newUser = await tx.user.upsert({
+            where: { email: `${member.toLowerCase()}@splitwise.demo` },
+            update: {},
+            create: { name: member, email: `${member.toLowerCase()}@splitwise.demo`, passwordHash: 'hashed' }
           });
           userMap[member.toLowerCase()] = newUser.id;
-          await tx.groupMember.create({
-            data: { groupId, userId: newUser.id }
+          const existingMember = await tx.groupMember.findUnique({
+            where: { groupId_userId: { groupId, userId: newUser.id } }
           });
+          if (!existingMember) {
+            await tx.groupMember.create({
+              data: { groupId, userId: newUser.id }
+            });
+          }
         }
       }
       
