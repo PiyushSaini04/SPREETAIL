@@ -237,142 +237,142 @@ export const confirmImport = async (groupId, rows, exchangeRate) => {
   let skippedCount = 0;
   let settlementsCount = 0;
 
-  // We fetch users to map name to ID
-  let dbUsers = await prisma.user.findMany();
-  let userMap = dbUsers.reduce((acc, u) => {
+  const dbUsers = await prisma.user.findMany();
+  const userMap = dbUsers.reduce((acc, u) => {
     acc[u.name.toLowerCase()] = u.id;
     return acc;
   }, {});
-  
-  await prisma.$transaction(async (tx) => {
-    for (const row of rows) {
-      const decision = row.userDecision || (row.suggestedAction === 'Import as Settlement' ? 'Import as Settlement' : 'Approve');
 
-      if (decision === 'Skip Row' || decision === 'Reject Row') {
-        skippedCount++;
-        continue;
-      }
-      
-      const p = row.parsed;
+  const existingMembers = await prisma.groupMember.findMany({
+    where: { groupId },
+    select: { userId: true },
+  });
+  const memberIds = new Set(existingMembers.map((m) => m.userId));
 
-      if (!p.paidBy) {
-        throw new AppError(`Cannot import expense "${p.description || 'Unknown'}" because the payer is missing.`, 400);
-      }
-      if (isNaN(p.amount) || p.amount < 0) {
-        throw new AppError(`Invalid amount for expense "${p.description || 'Unknown'}".`, 400);
-      }
-      
-      // Auto-create missing users if approved (use upsert to avoid duplicate email conflicts)
-      if (p.paidBy && !userMap[p.paidBy.toLowerCase()]) {
-        const newUser = await tx.user.upsert({
-          where: { email: `${p.paidBy.toLowerCase()}@splitwise.demo` },
-          update: {},
-          create: { name: p.paidBy, email: `${p.paidBy.toLowerCase()}@splitwise.demo`, passwordHash: 'hashed' }
-        });
-        userMap[p.paidBy.toLowerCase()] = newUser.id;
-        
-        // Add to group if not already a member
-        const existingMember = await tx.groupMember.findUnique({
-          where: { groupId_userId: { groupId, userId: newUser.id } }
-        });
-        if (!existingMember) {
-          await tx.groupMember.create({
-            data: { groupId, userId: newUser.id }
-          });
+  const namesNeeded = new Set();
+  for (const row of rows) {
+    const decision = row.userDecision || (row.suggestedAction === 'Import as Settlement' ? 'Import as Settlement' : 'Approve');
+    if (decision === 'Skip Row' || decision === 'Reject Row') continue;
+
+    const p = row.parsed;
+    if (p.paidBy) namesNeeded.add(p.paidBy);
+    for (const member of p.splitWith || []) namesNeeded.add(member);
+  }
+
+  for (const name of namesNeeded) {
+    const key = name.toLowerCase();
+    if (userMap[key]) continue;
+
+    const newUser = await prisma.user.upsert({
+      where: { email: `${key}@splitwise.demo` },
+      update: {},
+      create: { name, email: `${key}@splitwise.demo`, passwordHash: 'hashed' },
+    });
+    userMap[key] = newUser.id;
+  }
+
+  const membersToAdd = [...namesNeeded]
+    .map((name) => userMap[name.toLowerCase()])
+    .filter((id) => id && !memberIds.has(id));
+
+  if (membersToAdd.length > 0) {
+    await prisma.groupMember.createMany({
+      data: membersToAdd.map((userId) => ({ groupId, userId })),
+      skipDuplicates: true,
+    });
+  }
+
+  await prisma.$transaction(
+    async (tx) => {
+      for (const row of rows) {
+        const decision = row.userDecision || (row.suggestedAction === 'Import as Settlement' ? 'Import as Settlement' : 'Approve');
+
+        if (decision === 'Skip Row' || decision === 'Reject Row') {
+          skippedCount++;
+          continue;
         }
-      }
-      
-      for (const member of p.splitWith) {
-        if (!userMap[member.toLowerCase()]) {
-          const newUser = await tx.user.upsert({
-            where: { email: `${member.toLowerCase()}@splitwise.demo` },
-            update: {},
-            create: { name: member, email: `${member.toLowerCase()}@splitwise.demo`, passwordHash: 'hashed' }
-          });
-          userMap[member.toLowerCase()] = newUser.id;
-          const existingMember = await tx.groupMember.findUnique({
-            where: { groupId_userId: { groupId, userId: newUser.id } }
-          });
-          if (!existingMember) {
-            await tx.groupMember.create({
-              data: { groupId, userId: newUser.id }
-            });
-          }
+
+        const p = row.parsed;
+
+        if (!p.paidBy) {
+          throw new AppError(`Cannot import expense "${p.description || 'Unknown'}" because the payer is missing.`, 400);
         }
-      }
-      
-      let finalAmountInr = p.amount;
-      if (p.currency === 'USD') {
-        finalAmountInr = p.amount * exchangeRate;
-      }
+        if (isNaN(p.amount) || p.amount < 0) {
+          throw new AppError(`Invalid amount for expense "${p.description || 'Unknown'}".`, 400);
+        }
 
-      if (decision === 'Import as Settlement') {
-        const receiverId = userMap[p.splitWith[0]?.toLowerCase()];
-        if (!receiverId) throw new AppError(`Settlement "${p.description}" requires a valid receiver.`, 400);
+        let finalAmountInr = p.amount;
+        if (p.currency === 'USD') {
+          finalAmountInr = p.amount * exchangeRate;
+        }
 
-        await tx.settlement.create({
+        if (decision === 'Import as Settlement') {
+          const receiverId = userMap[p.splitWith[0]?.toLowerCase()];
+          if (!receiverId) throw new AppError(`Settlement "${p.description}" requires a valid receiver.`, 400);
+
+          await tx.settlement.create({
+            data: {
+              groupId,
+              paidById: userMap[p.paidBy.toLowerCase()],
+              paidToId: receiverId,
+              amount: finalAmountInr,
+              note: p.notes || p.description,
+            },
+          });
+          settlementsCount++;
+          importedCount++;
+          continue;
+        }
+
+        let finalSplitType = SplitType.EQUAL;
+        if (p.splitType === 'unequal') finalSplitType = SplitType.UNEQUAL;
+        if (p.splitType === 'percentage') finalSplitType = SplitType.PERCENTAGE;
+        if (p.splitType === 'share') finalSplitType = SplitType.SHARES;
+
+        let splits = [];
+        const members = p.splitWith;
+        if (finalSplitType === SplitType.EQUAL) {
+          const share = Math.round((finalAmountInr / members.length) * 100) / 100;
+          splits = members.map((name) => ({ userId: userMap[name.toLowerCase()], amountOwed: share }));
+        } else if (finalSplitType === SplitType.UNEQUAL) {
+          splits = members.map((name) => ({ userId: userMap[name.toLowerCase()], amountOwed: p.splitDetails[name] ?? 0 }));
+        } else if (finalSplitType === SplitType.PERCENTAGE) {
+          splits = members.map((name) => ({
+            userId: userMap[name.toLowerCase()],
+            amountOwed: Math.round(((p.splitDetails[name] ?? 0) / 100 * finalAmountInr) * 100) / 100,
+            percentage: p.splitDetails[name] ?? 0,
+          }));
+        } else if (finalSplitType === SplitType.SHARES) {
+          const totalShares = Object.values(p.splitDetails).reduce((s, v) => s + v, 0);
+          splits = members.map((name) => ({
+            userId: userMap[name.toLowerCase()],
+            amountOwed: Math.round(((p.splitDetails[name] ?? 1) / totalShares * finalAmountInr) * 100) / 100,
+            shares: p.splitDetails[name] ?? 1,
+          }));
+        }
+
+        await tx.expense.create({
           data: {
             groupId,
+            description: p.description,
+            amountInInr: finalAmountInr,
+            originalAmount: p.currency === 'USD' ? p.amount : null,
+            currency: p.currency,
+            exchangeRate: p.currency === 'USD' ? exchangeRate : null,
+            expenseDate: p.date ? new Date(p.date) : new Date(),
+            createdById: userMap[p.paidBy.toLowerCase()],
             paidById: userMap[p.paidBy.toLowerCase()],
-            paidToId: receiverId,
-            amount: finalAmountInr,
-            note: p.notes || p.description
-          }
+            splitType: finalSplitType,
+            splits: {
+              create: splits,
+            },
+          },
         });
-        settlementsCount++;
         importedCount++;
-        continue;
       }
-
-      // Import as Expense
-      let finalSplitType = SplitType.EQUAL;
-      if (p.splitType === 'unequal') finalSplitType = SplitType.UNEQUAL;
-      if (p.splitType === 'percentage') finalSplitType = SplitType.PERCENTAGE;
-      if (p.splitType === 'share') finalSplitType = SplitType.SHARES;
-
-      // Handle split amounts
-      let splits = [];
-      const members = p.splitWith;
-      if (finalSplitType === SplitType.EQUAL) {
-        const share = Math.round((finalAmountInr / members.length) * 100) / 100;
-        splits = members.map(name => ({ userId: userMap[name.toLowerCase()], amountOwed: share }));
-      } else if (finalSplitType === SplitType.UNEQUAL) {
-        splits = members.map(name => ({ userId: userMap[name.toLowerCase()], amountOwed: p.splitDetails[name] ?? 0 }));
-      } else if (finalSplitType === SplitType.PERCENTAGE) {
-        splits = members.map(name => ({
-          userId: userMap[name.toLowerCase()],
-          amountOwed: Math.round(((p.splitDetails[name] ?? 0) / 100 * finalAmountInr) * 100) / 100,
-          percentage: p.splitDetails[name] ?? 0
-        }));
-      } else if (finalSplitType === SplitType.SHARES) {
-        const totalShares = Object.values(p.splitDetails).reduce((s, v) => s + v, 0);
-        splits = members.map(name => ({
-          userId: userMap[name.toLowerCase()],
-          amountOwed: Math.round(((p.splitDetails[name] ?? 1) / totalShares * finalAmountInr) * 100) / 100,
-          shares: p.splitDetails[name] ?? 1
-        }));
-      }
-
-      await tx.expense.create({
-        data: {
-          groupId,
-          description: p.description,
-          amountInInr: finalAmountInr,
-          originalAmount: p.currency === 'USD' ? p.amount : null,
-          currency: p.currency,
-          exchangeRate: p.currency === 'USD' ? exchangeRate : null,
-          expenseDate: p.date ? new Date(p.date) : new Date(),
-          createdById: userMap[p.paidBy.toLowerCase()],
-          paidById: userMap[p.paidBy.toLowerCase()],
-          splitType: finalSplitType,
-          splits: {
-            create: splits
-          }
-        }
-      });
-      importedCount++;
-    }
-  });
+    },
+    { maxWait: 10000, timeout: 60000 }
+  );
 
   return { importedCount, skippedCount, settlementsCount };
 };
