@@ -5,8 +5,10 @@
   "main": "src/server.js",
   "type": "module",
   "scripts": {
+    "postinstall": "prisma generate",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
+    "build": "prisma generate && prisma migrate deploy",
     "test": "node --experimental-vm-modules node_modules/.bin/jest --runInBand",
     "test:unit": "node --experimental-vm-modules node_modules/.bin/jest tests/unit --runInBand",
     "test:integration": "node --experimental-vm-modules node_modules/.bin/jest tests/integration --runInBand",

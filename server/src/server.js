@@ -14,6 +14,7 @@ import balanceRoutes from './routes/balance.routes.js';
 
 import { errorHandler } from './middleware/error.middleware.js';
 import { initChatSocket } from './sockets/chat.socket.js';
+import { seedDemoUsers } from './utils/seed.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -59,9 +60,20 @@ app.use(errorHandler);
 
 // ── Start Server ──────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+
+async function startServer() {
+  try {
+    await seedDemoUsers();
+  } catch (err) {
+    console.error('⚠️ Demo user seed failed (server will still start):', err.message);
+  }
+
+  server.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+    console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  });
+}
+
+startServer();
 
 export { app, server };
